@@ -1,19 +1,71 @@
-import httpx
+import aiohttp
+import io
+import re
 from telegram import InputFile
-from config import CHUNK_SIZE
 
+CHUNK_SIZE = 1024 * 256  # 256KB
+BAR_SIZE = 20
 
-async def stream_to_telegram(app, chat_id, url, filename):
+def progress_bar(percent: float, length: int = 20) -> str:
+    filled = int(length * percent / 100)
+    return "█" * filled + "░" * (length - filled)
 
-    async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+def format_size(size: int) -> str:
+    if not size:
+        return "Desconhecido"
+    mb = size / (1024*1024)
+    if mb < 1024:
+        return f"{mb:.2f} MB"
+    gb = mb / 1024
+    return f"{gb:.2f} GB"
 
-        async with client.stream("GET", url) as response:
+def extract_filename(headers, url: str) -> str:
+    cd = headers.get("Content-Disposition")
+    if cd:
+        match = re.search('filename="?(.+?)"?$', cd)
+        if match:
+            return match.group(1)
+    name = url.split("/")[-1].split("?")[0]
+    if "." not in name:
+        name += ".mp4"
+    return name
 
-            async def generator():
-                async for chunk in response.aiter_bytes(CHUNK_SIZE):
-                    yield chunk
+async def stream_to_telegram(app, chat_id, url: str, progress_callback=None):
+    """
+    Faz streaming direto para o Telegram usando BytesIO
+    """
+    timeout = aiohttp.ClientTimeout(total=None)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, allow_redirects=True) as resp:
+            headers = resp.headers
+            final_url = str(resp.url)
+            total_size = int(headers.get("Content-Length", 0))
+            filename = extract_filename(headers, final_url)
 
-            await app.bot.send_document(
+            downloaded = 0
+            last_update = 0
+            data = bytearray()
+
+            if progress_callback:
+                await progress_callback(f"🎬 {filename}", 0, total_size, 0, progress_bar(0))
+
+            async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                if not chunk:
+                    continue
+                data.extend(chunk)
+                downloaded += len(chunk)
+                percent = (downloaded / total_size) * 100 if total_size else 0
+                if progress_callback and percent - last_update >= 1:
+                    last_update = percent
+                    bar = progress_bar(percent)
+                    await progress_callback(filename, downloaded, total_size, percent, bar)
+
+            bio = io.BytesIO(data)
+            bio.name = filename
+            bio.seek(0)
+
+            await app.bot.send_video(
                 chat_id=chat_id,
-                document=InputFile(generator(), filename=filename)
-            )
+                video=InputFile(bio, filename=filename),
+                supports_streaming=True
+    )
